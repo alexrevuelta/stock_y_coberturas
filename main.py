@@ -4,6 +4,7 @@ import requests
 import smtplib
 import ssl
 import urllib3
+import re
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -23,7 +24,7 @@ def get_odoo_data_for_brand(marca, config):
     rpc_url = f"{url}/jsonrpc"
 
     today = datetime.now()
-    # Calculamos sobre 15 días como pediste
+    # Periodo de 15 días solicitado
     date_limit = (today - timedelta(days=15)).strftime('%Y-%m-%d')
     first_day_month = today.replace(day=1).strftime('%Y-%m-%d')
 
@@ -47,7 +48,7 @@ def get_odoo_data_for_brand(marca, config):
         
         # --- LÓGICA ESPECIAL PARA EL OSO PARDO (DESGLOSE DE PACKS) ---
         if marca.upper() == "EL OSO PARDO":
-            log("📦 Marca EL OSO PARDO detectada: Desglosando packs...")
+            log("📦 Marca EL OSO PARDO detectada: Desglosando packs y filtrando referencias...")
             exploded_items = {}
             for p in products:
                 # Consultar si tiene Lista de Materiales (Pack)
@@ -55,23 +56,49 @@ def get_odoo_data_for_brand(marca, config):
                 boms = requests.post(rpc_url, json=payload_bom, timeout=20, verify=False).json().get('result', [])
                 
                 if boms and boms[0].get('bom_line_ids'):
+                    # Es un pack: buscamos sus componentes
                     payload_lines = {"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":[db,int(uid),token,"mrp.bom.line","read",[boms[0]['bom_line_ids']],{"fields":["product_id","product_qty"]}]}}
                     lines = requests.post(rpc_url, json=payload_lines, timeout=20, verify=False).json().get('result', [])
                     for line in lines:
                         comp_id = line['product_id'][0]
                         if comp_id not in exploded_items:
-                            # Datos del componente
+                            # Datos del componente unitario
                             payload_c = {"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":[db,int(uid),token,"product.product","read",[[comp_id]],{"fields":["default_code","name","qty_available","incoming_qty"]}]}}
                             c = requests.post(rpc_url, json=payload_c, timeout=20, verify=False).json().get('result', [{}])[0]
-                            exploded_items[comp_id] = {'id': comp_id, 'sku': c.get('default_code','-'), 'name': c.get('name','-'), 'stock': c.get('qty_available',0), 'pendiente': c.get('incoming_qty',0)}
+                            exploded_items[comp_id] = {
+                                'id': comp_id, 
+                                'sku': c.get('default_code','-'), 
+                                'name': c.get('name','-'), 
+                                'stock': c.get('qty_available',0), 
+                                'pendiente': c.get('incoming_qty',0)
+                            }
                 else:
-                    exploded_items[p['id']] = {'id': p['id'], 'sku': p['default_code'], 'name': p['name'], 'stock': p['qty_available'], 'pendiente': p['incoming_qty']}
-            products_to_process = list(exploded_items.values())
+                    # Producto individual (no pack)
+                    exploded_items[p['id']] = {
+                        'id': p['id'], 
+                        'sku': p['default_code'], 
+                        'name': p['name'], 
+                        'stock': p['qty_available'], 
+                        'pendiente': p['incoming_qty']
+                    }
+            
+            # --- FILTRADO FINAL: Eliminar referencias que empiecen por "PACK" ---
+            filtered_list = []
+            for item in exploded_items.values():
+                sku_upper = str(item['sku']).upper()
+                name_upper = str(item['name']).upper()
+                if not (sku_upper.startswith("PACK") or name_upper.startswith("PACK")):
+                    filtered_list.append(item)
+            
+            products_to_process = filtered_list
         else:
+            # Proceso estándar para el resto de marcas
             products_to_process = [{'id': p['id'], 'sku': p['default_code'], 'name': p['name'], 'stock': p['qty_available'], 'pendiente': p['incoming_qty']} for p in products]
 
         # 2. Buscar Ventas (15 días)
         p_ids = [p['id'] for p in products_to_process]
+        if not p_ids: return []
+        
         payload_sales = {
             "jsonrpc": "2.0", "method": "call", "params": {
                 "service": "object", "method": "execute_kw", "args": [
@@ -83,7 +110,7 @@ def get_odoo_data_for_brand(marca, config):
         }
         sales_lines = requests.post(rpc_url, json=payload_sales, timeout=30, verify=False).json().get('result', [])
 
-        # 3. Procesar resultados
+        # 3. Procesar resultados finales
         report = []
         for p in products_to_process:
             v_15d = sum(line['product_uom_qty'] for line in sales_lines if line['product_id'][0] == p['id'])
@@ -91,10 +118,15 @@ def get_odoo_data_for_brand(marca, config):
             cobertura = (p['stock'] / v_diaria) if v_diaria > 0 else (999 if p['stock'] > 0 else 0)
 
             report.append({
-                'sku': p['sku'], 'name': p['name'], 'stock': p['stock'],
-                'pendiente': p['pendiente'], 'v_15d': v_15d, 'cobertura': cobertura
+                'sku': p['sku'], 
+                'name': p['name'], 
+                'stock': p['stock'],
+                'pendiente': p['pendiente'], 
+                'v_15d': v_15d, 
+                'cobertura': cobertura
             })
 
+        # Ordenar por el más vendido
         report.sort(key=lambda x: x['v_15d'], reverse=True)
         return report[:10]
 
@@ -134,24 +166,33 @@ def generate_brand_html(marca, data):
     return html + "</tbody></table></div>"
 
 if __name__ == "__main__":
-    with open("config.json", encoding="utf-8") as f:
-        config = json.load(f)
-    full_email_body = f"""<html><body style="font-family: sans-serif; padding: 20px;">
-        <h1 style="color: #333; text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px;">📈 Reporte Stock y Cobertura (15 días)</h1>"""
-    any_data = False
-    for marca in config.get("marcas", []):
-        data_marca = get_odoo_data_for_brand(marca, config)
-        if data_marca:
-            any_data = True
-            full_email_body += generate_brand_html(marca, data_marca)
-    if any_data:
-        full_email_body += "</body></html>"
-        msg = MIMEMultipart()
-        msg['Subject'] = f"📊 REPORTE COBERTURA - {datetime.now().strftime('%d/%m/%Y')}"
-        msg['From'] = config['email_sender']; msg['To'] = ", ".join(config['recipients'])
-        msg.attach(MIMEText(full_email_body, 'html'))
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(config['smtp_server'], config['smtp_port'], context=context) as server:
-            server.login(config['email_sender'], os.environ.get("EMAIL_PASSWORD"))
-            server.sendmail(config['email_sender'], config['recipients'], msg.as_string())
-        log("✅ Email enviado correctamente.")
+    if not os.path.exists("config.json"):
+        log("❌ Error: No existe config.json")
+    else:
+        with open("config.json", encoding="utf-8") as f:
+            config = json.load(f)
+            
+        full_email_body = f"""<html><body style="font-family: sans-serif; padding: 20px;">
+            <h1 style="color: #333; text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px;">📈 Reporte Stock y Cobertura (Ventas 15 días)</h1>"""
+        
+        any_data = False
+        for marca in config.get("marcas", []):
+            data_marca = get_odoo_data_for_brand(marca, config)
+            if data_marca:
+                any_data = True
+                full_email_body += generate_brand_html(marca, data_marca)
+        
+        if any_data:
+            full_email_body += "</body></html>"
+            msg = MIMEMultipart()
+            msg['Subject'] = f"📊 REPORTE COBERTURA MULTI-MARCA - {datetime.now().strftime('%d/%m/%Y')}"
+            msg['From'] = config['email_sender']; msg['To'] = ", ".join(config['recipients'])
+            msg.attach(MIMEText(full_email_body, 'html'))
+            context = ssl.create_default_context()
+            try:
+                with smtplib.SMTP_SSL(config['smtp_server'], config['smtp_port'], context=context) as server:
+                    server.login(config['email_sender'], os.environ.get("EMAIL_PASSWORD"))
+                    server.sendmail(config['email_sender'], config['recipients'], msg.as_string())
+                log("✅ Email enviado correctamente.")
+            except Exception as e:
+                log(f"❌ Error enviando email: {e}")
