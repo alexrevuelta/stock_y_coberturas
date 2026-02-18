@@ -1,9 +1,9 @@
-name: Ejecutar Reporte Stock y Cobertura
+name: Ejecutar Reporte Diario
 
 on:
   schedule:
-    - cron: '0 7 * * *' # 07:00 UTC es 08:00 o 09:00 en España
-  workflow_dispatch: # Permite ejecutarlo a mano
+    - cron: '0 9 * * *' # 09:00 UTC = 10:00 AM España
+  workflow_dispatch:
 
 jobs:
   build:
@@ -11,15 +11,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
-
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
+        run: pip install requests
       - name: Run script
         env:
           ODOO_URL: ${{ secrets.ODOO_URL }}
@@ -27,5 +24,4 @@ jobs:
           ODOO_UID: ${{ secrets.ODOO_UID }}
           ODOO_TOKEN: ${{ secrets.ODOO_TOKEN }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python main.py
