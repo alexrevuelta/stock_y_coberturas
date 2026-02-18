@@ -1,0 +1,9 @@
+{
+  "marca_a_analizar": "MELCHIONI",
+  "email_sender": "arevuelta@goodbuy.es",
+  "recipients": [
+    "arevuelta@goodbuy.es"
+  ],
+  "smtp_server": "lin233.loading.es",
+  "smtp_port": 465
+}
