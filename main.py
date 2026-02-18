@@ -46,23 +46,26 @@ def get_odoo_data_for_brand(marca, config):
 
         products_to_process = []
         
-        # --- LÓGICA ESPECIAL PARA EL OSO PARDO (DESGLOSE DE PACKS) ---
+        # --- LÓGICA ESPECIAL PARA EL OSO PARDO (DESGLOSE DE PACKS Y FILTROS) ---
         if marca.upper() == "EL OSO PARDO":
-            log("📦 Marca EL OSO PARDO detectada: Desglosando packs y filtrando referencias...")
+            log("📦 Marca EL OSO PARDO detectada: Desglosando packs y aplicando filtros de exclusión...")
             exploded_items = {}
+            
+            # SKUs específicos a excluir solicitados por el usuario
+            SKUS_EXCLUIDOS = ["EOPQUESYSOB1", "EOPQUESYSOB2"]
+
             for p in products:
                 # Consultar si tiene Lista de Materiales (Pack)
                 payload_bom = {"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":[db,int(uid),token,"mrp.bom","search_read",[[["product_id","=",p['id']]]],{"fields":["bom_line_ids"]}]}}
                 boms = requests.post(rpc_url, json=payload_bom, timeout=20, verify=False).json().get('result', [])
                 
                 if boms and boms[0].get('bom_line_ids'):
-                    # Es un pack: buscamos sus componentes
+                    # Es un pack: buscamos sus componentes unitarios
                     payload_lines = {"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":[db,int(uid),token,"mrp.bom.line","read",[boms[0]['bom_line_ids']],{"fields":["product_id","product_qty"]}]}}
                     lines = requests.post(rpc_url, json=payload_lines, timeout=20, verify=False).json().get('result', [])
                     for line in lines:
                         comp_id = line['product_id'][0]
                         if comp_id not in exploded_items:
-                            # Datos del componente unitario
                             payload_c = {"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":[db,int(uid),token,"product.product","read",[[comp_id]],{"fields":["default_code","name","qty_available","incoming_qty"]}]}}
                             c = requests.post(rpc_url, json=payload_c, timeout=20, verify=False).json().get('result', [{}])[0]
                             exploded_items[comp_id] = {
@@ -73,7 +76,7 @@ def get_odoo_data_for_brand(marca, config):
                                 'pendiente': c.get('incoming_qty',0)
                             }
                 else:
-                    # Producto individual (no pack)
+                    # Producto individual
                     exploded_items[p['id']] = {
                         'id': p['id'], 
                         'sku': p['default_code'], 
@@ -82,12 +85,18 @@ def get_odoo_data_for_brand(marca, config):
                         'pendiente': p['incoming_qty']
                     }
             
-            # --- FILTRADO FINAL: Eliminar referencias que empiecen por "PACK" ---
+            # --- FILTRADO FINAL ---
             filtered_list = []
             for item in exploded_items.values():
-                sku_upper = str(item['sku']).upper()
-                name_upper = str(item['name']).upper()
-                if not (sku_upper.startswith("PACK") or name_upper.startswith("PACK")):
+                sku_upper = str(item['sku']).upper().strip()
+                name_upper = str(item['name']).upper().strip()
+                
+                # Regla 1: No empezar por "PACK"
+                empezar_pack = sku_upper.startswith("PACK") or name_upper.startswith("PACK")
+                # Regla 2: No estar en la lista de exclusión específica
+                esta_excluido = sku_upper in SKUS_EXCLUIDOS
+
+                if not empezar_pack and not esta_excluido:
                     filtered_list.append(item)
             
             products_to_process = filtered_list
