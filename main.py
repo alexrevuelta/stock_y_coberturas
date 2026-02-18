@@ -3,15 +3,18 @@ import json
 import requests
 import smtplib
 import ssl
+import re
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from openai import OpenAI
 
-# --- FUNCIONES DE LOG Y ODOO ---
+# --- CONFIGURACIÓN DE LOGS ---
 def log(msg):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
-def get_stock_and_coverage(config):
+# --- CONEXIÓN CON ODOO ---
+def get_odoo_data(config):
     url = os.environ.get("ODOO_URL")
     db = os.environ.get("ODOO_DB")
     uid = os.environ.get("ODOO_UID")
@@ -22,37 +25,32 @@ def get_stock_and_coverage(config):
     first_day_month = today.replace(day=1).strftime('%Y-%m-%d')
     date_limit = (today - timedelta(days=30)).strftime('%Y-%m-%d')
 
-    # Filtro dinámico: busca por la marca configurada en config.json
-    marca = config.get("marca_a_analizar", "MELCHIONI")
-    log(f"🔎 Buscando productos de la marca: {marca}...")
-    
-    filtro_productos = [
-        "|", 
-        ["name", "ilike", marca], 
-        ["default_code", "ilike", marca]
-    ]
+    lista_marcas = config.get("marcas", ["OPPO"])
+    log(f"🔎 Analizando stock para: {', '.join(lista_marcas)}...")
+
+    # Construir filtro dinámico para múltiples marcas (Operador OR '|')
+    filtro_marcas = ["|"] * (len(lista_marcas) - 1)
+    for marca in lista_marcas:
+        filtro_marcas.append(["name", "ilike", marca])
 
     try:
-        # 1. Obtener Productos y Stock Actual
-        payload_products = {
+        # 1. Buscar Productos
+        payload_prod = {
             "jsonrpc": "2.0", "method": "call", "params": {
                 "service": "object", "method": "execute_kw", "args": [
                     db, int(uid), token, "product.product", "search_read",
-                    [filtro_productos],
+                    [filtro_marcas],
                     {"fields": ["id", "default_code", "barcode", "name", "qty_available", "incoming_qty"]}
                 ]
             }
         }
-        res_prod = requests.post(rpc_url, json=payload_products, timeout=30).json()
+        res_prod = requests.post(rpc_url, json=payload_prod, timeout=30).json()
         products = res_prod.get('result', [])
-
-        if not products:
-            log("⚠️ No se encontraron productos.")
-            return []
+        if not products: return []
 
         p_ids = [p['id'] for p in products]
 
-        # 2. Obtener Ventas de los últimos 30 días
+        # 2. Buscar Ventas (últimos 30 días)
         payload_sales = {
             "jsonrpc": "2.0", "method": "call", "params": {
                 "service": "object", "method": "execute_kw", "args": [
@@ -65,21 +63,19 @@ def get_stock_and_coverage(config):
         res_sales = requests.post(rpc_url, json=payload_sales, timeout=30).json()
         sales_lines = res_sales.get('result', [])
 
-        # 3. Procesar datos
-        report = []
+        # 3. Procesar y calcular cobertura
+        final_report = []
         for p in products:
             p_id = p['id']
             v_30d = sum(line['product_uom_qty'] for line in sales_lines if line['product_id'][0] == p_id)
             v_mes = sum(line['product_uom_qty'] for line in sales_lines if line['product_id'][0] == p_id and line['create_date'] >= first_day_month)
             
-            # Cálculo de Cobertura
-            venta_diaria = v_30d / 30
             stock = p.get('qty_available', 0)
-            # Si no hay ventas, pero hay stock, ponemos 999 (cobertura infinita)
-            cobertura = (stock / venta_diaria) if venta_diaria > 0 else (999 if stock > 0 else 0)
+            v_diaria = v_30d / 30
+            cobertura = (stock / v_diaria) if v_diaria > 0 else (999 if stock > 0 else 0)
 
-            report.append({
-                'sku': p.get('default_code', 'S/N'),
+            final_report.append({
+                'sku': p.get('default_code', '-'),
                 'ean': p.get('barcode', '-'),
                 'name': p.get('name', '-'),
                 'stock': stock,
@@ -89,87 +85,121 @@ def get_stock_and_coverage(config):
                 'cobertura': cobertura
             })
 
-        # Ordenar por el más vendido (v_30d) y devolver el Top 10
-        report.sort(key=lambda x: x['v_30d'], reverse=True)
-        return report[:10]
+        # Ordenar por ventas y devolver Top 10
+        final_report.sort(key=lambda x: x['v_30d'], reverse=True)
+        return final_report[:10]
 
     except Exception as e:
         log(f"❌ Error Odoo: {e}")
         return []
 
-def send_email(data, config):
-    if not data: return
-    marca = config.get("marca_a_analizar", "OPPO")
+# --- GENERAR CONCLUSIONES CON IA ---
+def get_ai_analysis(data, marcas):
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key: return "Análisis de IA no disponible (falta API Key)."
+
+    client = OpenAI(api_key=api_key)
+    
+    # Crear un resumen de texto para que la IA lo entienda
+    resumen = "\n".join([f"- {i['name']} (SKU: {i['sku']}): Stock {i['stock']}, Ventas 30d {i['v_30d']}, Cobertura {i['cobertura']:.0f} días, Pendiente recibir {i['pendiente']}." for i in data])
+
+    prompt = f"""
+    Como Director de Operaciones, analiza estos datos de stock y ventas de las marcas: {', '.join(marcas)}.
+    Datos:
+    {resumen}
+
+    Escribe un informe ejecutivo breve (3 párrafos cortos) que incluya:
+    1. Alerta de rotura: ¿Qué modelos se agotarán en menos de 10 días?
+    2. Análisis de ventas: ¿Qué modelo es el líder absoluto?
+    3. Recomendación: ¿Debemos adelantar pedidos o liquidar stock de algún modelo lento?
+    
+    Sé directo, usa un tono profesional y usa negritas en los modelos de productos.
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        return response.choices[0].message.content.replace("\n", "<br>")
+    except Exception as e:
+        return f"Error generando análisis de IA: {e}"
+
+# --- ENVIAR EMAIL ---
+def send_email(data, ai_text, config):
+    sender = config.get("email_sender")
+    recipients = config.get("recipients", [])
+    marcas_str = ", ".join(config.get("marcas", []))
     
     html = f"""
     <html><head><style>
         body {{ font-family: sans-serif; font-size: 13px; color: #333; }}
-        table {{ border-collapse: collapse; width: 100%; border: 1px solid #ddd; }}
-        th, td {{ padding: 10px; border: 1px solid #ddd; text-align: left; }}
-        th {{ background-color: #f4f4f4; font-weight: bold; }}
+        .ia-box {{ background-color: #f0f7ff; border-left: 5px solid #007bff; padding: 15px; margin-bottom: 20px; }}
+        table {{ border-collapse: collapse; width: 100%; font-size: 12px; }}
+        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+        th {{ background-color: #f8f9fa; }}
         .center {{ text-align: center; }}
-        .critico {{ color: #d9534f; font-weight: bold; }} /* Rojo */
-        .bajo {{ color: #f0ad4e; font-weight: bold; }}    /* Naranja */
-        .ok {{ color: #5cb85c; }}                         /* Verde */
-        h2 {{ color: #2c3e50; border-bottom: 2px solid #eee; }}
+        .critico {{ color: #d9534f; font-weight: bold; }}
+        .bajo {{ color: #f0ad4e; font-weight: bold; }}
+        .ok {{ color: #5cb85c; }}
     </style></head><body>
-    <h2>📊 Informe de Stock y Cobertura: {marca}</h2>
-    <p>Top 10 productos más vendidos en los últimos 30 días.</p>
-    <table>
-        <thead>
-            <tr>
-                <th>SKU</th><th>EAN</th><th>Nombre del Producto</th>
-                <th class="center">Stock Act.</th><th class="center">Pendiente</th>
-                <th class="center">Ventas Mes</th><th class="center">Ventas 30d</th>
-                <th class="center">Días Cobertura</th>
-            </tr>
-        </thead>
-        <tbody>"""
+        <h2>📊 Reporte Stock y Cobertura: {marcas_str}</h2>
+        
+        <div class="ia-box">
+            <h3 style="margin-top:0; color:#007bff;">🤖 Análisis Inteligente</h3>
+            <p>{ai_text}</p>
+        </div>
+
+        <table><thead><tr>
+            <th>SKU</th><th>Nombre del Producto</th><th class="center">Stock</th>
+            <th class="center">Pendiente</th><th class="center">Ventas Mes</th>
+            <th class="center">Ventas 30d</th><th class="center">Cobertura</th>
+        </tr></thead><tbody>"""
 
     for item in data:
-        # Lógica de colores para cobertura
         cob = item['cobertura']
-        clase_cob = "ok"
-        if cob < 7: clase_cob = "critico"
-        elif cob < 15: clase_cob = "bajo"
-        
+        clase = "ok"
+        if cob < 7: clase = "critico"
+        elif cob < 15: clase = "bajo"
         txt_cob = f"{cob:.0f} días" if cob < 999 else "Sin ventas"
 
         html += f"""
-            <tr>
-                <td>{item['sku']}</td>
-                <td>{item['ean']}</td>
-                <td>{item['name']}</td>
-                <td class="center">{item['stock']:.0f}</td>
-                <td class="center" style="color: #3498db;">{item['pendiente']:.0f}</td>
-                <td class="center">{item['v_mes']:.0f}</td>
-                <td class="center"><b>{item['v_30d']:.0f}</b></td>
-                <td class="center {clase_cob}">{txt_cob}</td>
-            </tr>"""
-            
-    html += "</tbody></table><p><small>Generado automáticamente desde Odoo.</small></p></body></html>"
+        <tr>
+            <td>{item['sku']}</td><td>{item['name']}</td>
+            <td class="center">{item['stock']:.0f}</td>
+            <td class="center" style="color:blue;">{item['pendiente']:.0f}</td>
+            <td class="center">{item['v_mes']:.0f}</td>
+            <td class="center"><b>{item['v_30d']:.0f}</b></td>
+            <td class="center {clase}">{txt_cob}</td>
+        </tr>"""
+
+    html += "</tbody></table></body></html>"
 
     msg = MIMEMultipart()
-    msg['Subject'] = f"📈 STOCK Y COBERTURA: {marca} - {datetime.now().strftime('%d/%m/%Y')}"
-    msg['From'] = config['email_sender']
-    msg['To'] = ", ".join(config['recipients'])
+    msg['Subject'] = f"📈 STOCK Y COBERTURA: {marcas_str} - {datetime.now().strftime('%d/%m/%Y')}"
+    msg['From'] = sender
+    msg['To'] = ", ".join(recipients)
     msg.attach(MIMEText(html, 'html'))
 
     try:
         context = ssl.create_default_context()
         with smtplib.SMTP_SSL(config['smtp_server'], config['smtp_port'], context=context) as server:
-            server.login(config['email_sender'], os.environ.get("EMAIL_PASSWORD"))
-            server.sendmail(config['email_sender'], config['recipients'], msg.as_string())
-        log("✅ Email de cobertura enviado.")
+            server.login(sender, os.environ.get("EMAIL_PASSWORD"))
+            server.sendmail(sender, recipients, msg.as_string())
+        log("✅ Email enviado correctamente.")
     except Exception as e:
-        log(f"❌ Error email: {e}")
+        log(f"❌ Error enviando email: {e}")
 
+# --- FLUJO PRINCIPAL ---
 if __name__ == "__main__":
     with open("config.json", encoding="utf-8") as f:
-        config_data = json.load(f)
-    
-    resultados = get_stock_and_coverage(config_data)
-    if resultados:
-        send_email(resultados, config_data)
+        config = json.load(f)
+
+    data = get_odoo_data(config)
+    if data:
+        log("🤖 Generando conclusiones con IA...")
+        conclusiones = get_ai_analysis(data, config.get("marcas", []))
+        send_email(data, conclusiones, config)
     else:
-        log("No hay datos para enviar.")
+        log("⚠️ No se obtuvieron datos de Odoo.")
