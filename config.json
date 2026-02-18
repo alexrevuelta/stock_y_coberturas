@@ -1,5 +1,5 @@
 {
-  "marcas": ["OPPO", "TCL", "MELCHIONI", "BENZI"], 
+  "marcas": ["TCL", "OPPO", "MELCHIONI", "SEVERIN", "BLAUPUNKT", "EL OSO PARDO"],
   "email_sender": "arevuelta@goodbuy.es",
   "recipients": ["arevuelta@goodbuy.es"],
   "smtp_server": "lin233.loading.es",
