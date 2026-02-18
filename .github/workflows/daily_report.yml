@@ -27,4 +27,5 @@ jobs:
           ODOO_UID: ${{ secrets.ODOO_UID }}
           ODOO_TOKEN: ${{ secrets.ODOO_TOKEN }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python main.py
