@@ -23,9 +23,10 @@ def get_odoo_data_for_brand(marca, config):
     rpc_url = f"{url}/jsonrpc"
 
     today = datetime.now()
+    # Ventas de los últimos 15 días
     date_limit = (today - timedelta(days=15)).strftime('%Y-%m-%d')
 
-    log(f"🔎 Consultando Odoo para {marca} (Todos los productos)...")
+    log(f"🔎 Consultando Odoo para {marca} (Periodo: 15 días)...")
 
     try:
         # 1. Buscar Productos
@@ -64,7 +65,6 @@ def get_odoo_data_for_brand(marca, config):
                 else:
                     exploded_items[p['id']] = {'id': p['id'], 'sku': p['default_code'], 'name': p['name'], 'stock': p['qty_available'], 'pendiente': p['incoming_qty']}
             
-            # Filtrado PACKS y SKUs específicos
             products_to_process = [i for i in exploded_items.values() if not (str(i['sku']).upper().startswith("PACK") or str(i['name']).upper().startswith("PACK") or str(i['sku']).upper().strip() in SKUS_EXCLUIDOS)]
         else:
             products_to_process = [{'id': p['id'], 'sku': p['default_code'], 'name': p['name'], 'stock': p['qty_available'], 'pendiente': p['incoming_qty']} for p in products]
@@ -79,7 +79,13 @@ def get_odoo_data_for_brand(marca, config):
         for p in products_to_process:
             v_15d = sum(line['product_uom_qty'] for line in sales_lines if line['product_id'][0] == p['id'])
             v_diaria = v_15d / 15
-            cobertura = (p['stock'] / v_diaria) if v_diaria > 0 else (999 if p['stock'] > 0 else 0)
+            
+            # Nueva lógica de cobertura:
+            if v_15d > 0:
+                cobertura = p['stock'] / v_diaria
+            else:
+                cobertura = -1 # Marcador para "Sin ventas"
+
             report.append({'sku':p['sku'], 'name':p['name'], 'stock':p['stock'], 'pendiente':p['pendiente'], 'v_15d':v_15d, 'cobertura':cobertura})
 
         # Ordenar por ventas de mayor a menor
@@ -108,15 +114,24 @@ def generate_email_html(marca, data):
             <tbody>"""
     
     for item in data:
-        # Estilo de fila: Rojo si el stock es 0
+        # Estilo de fila: Rojo si el stock es 0 o menos
         row_style = 'style="background-color: #f8d7da; color: #721c24;"' if item['stock'] <= 0 else ""
         
-        # Color del texto de cobertura
-        cob_style = "color: #5cb85c;"
-        if item['cobertura'] < 7: cob_style = "color: #d9534f; font-weight: bold;"
-        elif item['cobertura'] < 15: cob_style = "color: #f0ad4e; font-weight: bold;"
-        
-        txt_cob = f"{item['cobertura']:.0f} días" if item['cobertura'] < 999 else "Sin ventas"
+        # Lógica de texto y color de cobertura
+        if item['v_15d'] <= 0:
+            txt_cob = "Sin ventas"
+            cob_style = "color: #999;" # Gris si no hay ventas
+        else:
+            # Si hay ventas, calculamos los días
+            if item['cobertura'] > 365:
+                txt_cob = "+365 días"
+                cob_style = "color: #5cb85c;" # Verde (Mucha cobertura)
+            else:
+                txt_cob = f"{item['cobertura']:.0f} días"
+                # Colores de alerta por días
+                if item['cobertura'] < 7: cob_style = "color: #d9534f; font-weight: bold;"
+                elif item['cobertura'] < 15: cob_style = "color: #f0ad4e; font-weight: bold;"
+                else: cob_style = "color: #5cb85c;"
 
         html += f"""
         <tr {row_style}>
@@ -130,7 +145,7 @@ def generate_email_html(marca, data):
     
     return html + "</tbody></table></body></html>"
 
-# --- ENVÍO INDIVIDUAL ---
+# --- ENVÍO INDIVIDUAL POR MARCA ---
 def send_brand_email(marca, html_content, config):
     msg = MIMEMultipart()
     msg['Subject'] = f"📈 STOCK {marca} - {datetime.now().strftime('%d/%m/%Y')}"
