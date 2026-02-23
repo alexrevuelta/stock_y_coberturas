@@ -50,7 +50,7 @@ def get_odoo_data_for_brand(marca, config):
             SKUS_EXCLUIDOS = ["EOPQUESYSOB1", "EOPQUESYSOB2"]
 
             for p in products:
-                payload_bom = {"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":[db,int(uid),token,"mrp.bom","search_read",[[["product_id","=",p['id']]]],{"fields":["bom_line_ids"]}]}}
+                payload_bom = {"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":[db,int(uid),token,"mrp.bom","search_read",[[["product_id", "=", p['id']]]],{"fields":["bom_line_ids"]}]}}
                 boms = requests.post(rpc_url, json=payload_bom, timeout=20, verify=False).json().get('result', [])
                 
                 if boms and boms[0].get('bom_line_ids'):
@@ -65,9 +65,23 @@ def get_odoo_data_for_brand(marca, config):
                 else:
                     exploded_items[p['id']] = {'id': p['id'], 'sku': p['default_code'], 'name': p['name'], 'stock': p['qty_available'], 'pendiente': p['incoming_qty']}
             
-            products_to_process = [i for i in exploded_items.values() if not (str(i['sku']).upper().startswith("PACK") or str(i['name']).upper().startswith("PACK") or str(i['sku']).upper().strip() in SKUS_EXCLUIDOS)]
+            # Filtrado PACKS, SKUs específicos y exclusión de BISSELL
+            products_to_process = [
+                i for i in exploded_items.values() 
+                if not (
+                    str(i['sku']).upper().startswith("PACK") or 
+                    str(i['name']).upper().startswith("PACK") or 
+                    str(i['sku']).upper().strip() in SKUS_EXCLUIDOS or
+                    "BISSELL" in str(i['name']).upper()  # <--- Filtro Bissell añadido aquí
+                )
+            ]
         else:
-            products_to_process = [{'id': p['id'], 'sku': p['default_code'], 'name': p['name'], 'stock': p['qty_available'], 'pendiente': p['incoming_qty']} for p in products]
+            # Proceso estándar para el resto de marcas con filtro Bissell
+            products_to_process = [
+                {'id': p['id'], 'sku': p['default_code'], 'name': p['name'], 'stock': p['qty_available'], 'pendiente': p['incoming_qty']} 
+                for p in products 
+                if "BISSELL" not in str(p['name']).upper() # <--- Filtro Bissell añadido aquí
+            ]
 
         # 2. Ventas 15 días
         p_ids = [p['id'] for p in products_to_process]
@@ -80,7 +94,6 @@ def get_odoo_data_for_brand(marca, config):
             v_15d = sum(line['product_uom_qty'] for line in sales_lines if line['product_id'][0] == p['id'])
             v_diaria = v_15d / 15
             
-            # Nueva lógica de cobertura:
             if v_15d > 0:
                 cobertura = p['stock'] / v_diaria
             else:
@@ -120,15 +133,13 @@ def generate_email_html(marca, data):
         # Lógica de texto y color de cobertura
         if item['v_15d'] <= 0:
             txt_cob = "Sin ventas"
-            cob_style = "color: #999;" # Gris si no hay ventas
+            cob_style = "color: #999;" 
         else:
-            # Si hay ventas, calculamos los días
             if item['cobertura'] > 365:
                 txt_cob = "+365 días"
-                cob_style = "color: #5cb85c;" # Verde (Mucha cobertura)
+                cob_style = "color: #5cb85c;" 
             else:
                 txt_cob = f"{item['cobertura']:.0f} días"
-                # Colores de alerta por días
                 if item['cobertura'] < 7: cob_style = "color: #d9534f; font-weight: bold;"
                 elif item['cobertura'] < 15: cob_style = "color: #f0ad4e; font-weight: bold;"
                 else: cob_style = "color: #5cb85c;"
