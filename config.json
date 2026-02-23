@@ -2,6 +2,9 @@
   "marcas": ["TCL", "OPPO", "MELCHIONI", "SEVERIN", "BLAUPUNKT", "SIXHOME", "EL OSO PARDO"],
   "email_sender": "arevuelta@goodbuy.es",
   "recipients": [
+    "judith@goodbuy.es",
+    "israel@goodbuy.es",
+    "rocio@goodbuy.es"
     "arevuelta@goodbuy.es"
   ],
   "smtp_server": "lin233.loading.es",
